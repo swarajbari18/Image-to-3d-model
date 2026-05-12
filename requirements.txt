@@ -1,0 +1,54 @@
+# ============================================================
+# Image-to-3D Pipeline — Python Requirements
+# Python: 3.10+   CUDA: 12.1+ (Colab T4/L4)
+# ============================================================
+
+# --- Core utilities ---
+python-dotenv>=1.0.0
+Pillow>=10.0.0
+numpy>=1.24.0,<2.0.0
+requests>=2.28.0
+tqdm>=4.65.0
+rich>=13.0.0
+pydantic>=2.0.0
+
+# --- Gemini API (NEW SDK — google-generativeai is deprecated EOL Nov 2025) ---
+google-genai>=2.1.0
+
+# --- HuggingFace ecosystem ---
+huggingface_hub>=0.23.0
+transformers>=4.45.0
+accelerate>=0.30.0
+safetensors>=0.4.0
+diffusers>=0.36.0
+
+# --- pix2gestalt dependencies (installed alongside repo clone) ---
+omegaconf>=2.3.0
+einops>=0.7.0
+
+# --- SAM2 ---
+# Option A (PyPI): sam2>=1.0.0
+# Option B (GitHub, latest): git+https://github.com/facebookresearch/sam2.git
+sam2>=1.0.0
+
+# --- 3D mesh processing ---
+trimesh[easy]>=4.0.0
+pymeshfix>=0.18.0
+pymeshlab>=2023.12
+open3d>=0.18.0
+xatlas>=0.0.11
+
+# --- Image processing ---
+opencv-python-headless>=4.8.0
+scikit-image>=0.21.0
+imageio>=2.31.0
+scipy>=1.10.0
+matplotlib>=3.7.0
+
+# --- PyTorch (pre-installed on Colab; install manually for local dev) ---
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+torch>=2.5.1
+torchvision>=0.20.1
+
+# --- Optional performance (Colab L4 / A100 only) ---
+# xformers>=0.0.28
