@@ -110,15 +110,22 @@ class ReconstructionResult:
 
 
 def _build_hunyuan_shape_loader():
-    """Return a loader fn for the Hunyuan3D shape pipeline."""
+    """Return a loader fn for the Hunyuan3D shape pipeline.
+
+    Uses subfolder='hunyuan3d-dit-v2-mv' (standard, full 50-step quality).
+    Better geometric detail on complex surfaces like the camera island/bump.
+    Trade-off: ~3x slower than Turbo on T4 (~10-15 min shape gen vs ~3-5 min).
+    To switch to Turbo: change subfolder to 'hunyuan3d-dit-v2-mv-turbo'.
+    """
 
     def _load():
         sys.path.insert(0, str(cfg.HUNYUAN3D_REPO_DIR))
         from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline  # type: ignore[import]
 
-        print("[reconstruction] Loading Hunyuan3D shape pipeline (fp16)...")
+        print("[reconstruction] Loading Hunyuan3D shape pipeline (fp16, standard)...")
         pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
             "tencent/Hunyuan3D-2mv",
+            subfolder="hunyuan3d-dit-v2-mv",
             torch_dtype=cfg.TORCH_DTYPE,
             cache_dir=str(cfg.HUNYUAN3D_CACHE_DIR),
             token=cfg.HF_TOKEN,
@@ -134,15 +141,20 @@ def _build_hunyuan_shape_loader():
 
 
 def _build_hunyuan_texture_loader():
-    """Return a loader fn for the Hunyuan3D texture pipeline."""
+    """Return a loader fn for the Hunyuan3D texture pipeline.
+
+    Texture model is in tencent/Hunyuan3D-2 (NOT tencent/Hunyuan3D-2mv).
+    Uses subfolder='hunyuan3d-paint-v2-0-turbo' (~6 GB) not the whole repo.
+    """
 
     def _load():
         sys.path.insert(0, str(cfg.HUNYUAN3D_REPO_DIR))
         from hy3dgen.texgen import Hunyuan3DPaintPipeline  # type: ignore[import]
 
-        print("[reconstruction] Loading Hunyuan3D texture pipeline (fp16)...")
+        print("[reconstruction] Loading Hunyuan3D texture pipeline (fp16, turbo)...")
         pipeline = Hunyuan3DPaintPipeline.from_pretrained(
-            "tencent/Hunyuan3D-2mv",
+            "tencent/Hunyuan3D-2",
+            subfolder="hunyuan3d-paint-v2-0-turbo",
             torch_dtype=cfg.TORCH_DTYPE,
             cache_dir=str(cfg.HUNYUAN3D_CACHE_DIR),
             token=cfg.HF_TOKEN,

@@ -159,7 +159,7 @@ Use **Cell 14** to call `run_pipeline()` — this is equivalent to Cells 8-13.
 | Model | Size | Source | Token Required |
 |---|---|---|---|
 | SAM2 Hiera-Large | 224 MB | Meta CDN | No |
-| SynergyAmodal (ldm + vae) | ~5-8 GB | HuggingFace (public) | No |
+| SynergyAmodal (ldm + vae) | ~16.5 GB (ldm=15.6 GB, vae=929 MB) | [cloudyfall/DeoccAnything](https://huggingface.co/cloudyfall/DeoccAnything) | No |
 | Hunyuan3D-2mv | ~8-10 GB | HuggingFace (gated) | **Yes** (`HF_TOKEN`) |
 | SD Inpainting | ~3.5 GB | HuggingFace (public) | No |
 

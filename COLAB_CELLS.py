@@ -87,6 +87,7 @@ else:
 # --- Install SynergyAmodal requirements ---
 # requirements.txt uses modern compatible versions — install as-is.
 # Only skip gradio (not needed in pipeline) to save install time.
+# xformers is required for memory-efficient attention (per SynergyAmodal README).
 get_ipython().system(
     "pip install -q "
     "accelerate==1.0.1 "
@@ -100,6 +101,7 @@ get_ipython().system(
     "pytorch_lightning==2.5.0 "
     "transformers==4.45.0"
 )
+get_ipython().system("pip install -q xformers")  # required for memory-efficient attention
 
 # --- Add to sys.path so imports work at runtime ---
 if "/content/SynergyAmodal" not in sys.path:
@@ -149,8 +151,8 @@ else:
 # =============================================================================
 # CELL 6 — Download model weights
 # =============================================================================
-# SAM2:           ~224 MB — Meta CDN, no token
-# SynergyAmodal:  ~5-8 GB — HuggingFace, no token
+# SAM2:           ~224 MB  — Meta CDN, no token
+# SynergyAmodal:  ~16.5 GB — cloudyfall/DeoccAnything on HuggingFace (ldm=15.6 GB, vae=929 MB)
 # Hunyuan3D: ~8-10 GB  — HuggingFace, HF_TOKEN required
 
 import os, shutil
@@ -177,7 +179,8 @@ if not os.path.exists(sam2_ckpt):
         shutil.copy(sam2_ckpt, sam2_gdrive)
 print(f"✅ SAM2: {sam2_ckpt}")
 
-# --- SynergyAmodal weights (ldm.ckpt + vae.ckpt, ~5-8 GB total) ---
+# --- SynergyAmodal weights (ldm.ckpt=15.6 GB, vae.ckpt=929 MB, ~16.5 GB total) ---
+# Source: https://huggingface.co/cloudyfall/DeoccAnything  (per SynergyAmodal README)
 sa_ckpt_dir = "/content/models/synergyamodal"
 sa_gdrive   = f"{GDRIVE_CACHE}/synergyamodal"
 os.makedirs(sa_ckpt_dir, exist_ok=True)
@@ -190,34 +193,84 @@ if not os.path.exists(ldm_ckpt) or not os.path.exists(vae_ckpt):
         print("📂 Copying SynergyAmodal weights from Google Drive cache...")
         import shutil; shutil.copytree(sa_gdrive, sa_ckpt_dir, dirs_exist_ok=True)
     else:
-        print("⬇️  Downloading SynergyAmodal weights from HuggingFace (~5-8 GB)...")
-        from huggingface_hub import hf_hub_download
-        hf_hub_download(repo_id="imlixinyang/SynergyAmodal", filename="ldm.ckpt", local_dir=sa_ckpt_dir)
-        hf_hub_download(repo_id="imlixinyang/SynergyAmodal", filename="vae.ckpt", local_dir=sa_ckpt_dir)
+        print("⬇️  Downloading SynergyAmodal ldm.ckpt (~15.6 GB) — this takes ~10-15 min...")
+        get_ipython().system(
+            f"wget -q --show-progress "
+            f"'https://huggingface.co/cloudyfall/DeoccAnything/resolve/main/ldm_ckpt_dir/epoch%3D8-step%3D58000.ckpt?download=true' "
+            f"-O {ldm_ckpt}"
+        )
+        print("⬇️  Downloading SynergyAmodal vae.ckpt (~929 MB)...")
+        get_ipython().system(
+            f"wget -q --show-progress "
+            f"'https://huggingface.co/cloudyfall/DeoccAnything/resolve/main/vae_ckpt_dir/epoch%3D5-step%3D100000.ckpt?download=true' "
+            f"-O {vae_ckpt}"
+        )
         os.makedirs(sa_gdrive, exist_ok=True)
         import shutil; shutil.copytree(sa_ckpt_dir, sa_gdrive, dirs_exist_ok=True)
         print("💾 Saved SynergyAmodal weights to Google Drive cache.")
-print(f"✅ SynergyAmodal: {ldm_ckpt}, {vae_ckpt}")
+print(f"✅ SynergyAmodal: {ldm_ckpt} ({os.path.getsize(ldm_ckpt)/1e9:.1f} GB), {vae_ckpt} ({os.path.getsize(vae_ckpt)/1e6:.0f} MB)")
 
-# --- Hunyuan3D-2mv (~8-10 GB) ---
-hunyuan_local = "/content/models/hunyuan3d"
+# --- Hunyuan3D weights (shape + texture) ---
+# Shape:   tencent/Hunyuan3D-2mv  → subfolder hunyuan3d-dit-v2-mv       (~10 GB, standard)
+# Texture: tencent/Hunyuan3D-2    → subfolder hunyuan3d-paint-v2-0-turbo  (~6 GB)
+#
+# WHY STANDARD (not Turbo)?
+#   Standard uses full 50-step diffusion = better geometric detail on complex
+#   surfaces like the camera island/bump. Turbo (4-8 steps) is faster but trades
+#   some detail. For product photography fidelity, standard is the right call.
+#   To switch to Turbo: change allow_patterns below + subfolder in reconstruction.py.
+#
+# WHY allow_patterns?
+#   snapshot_download with no filter grabs ALL variants in the repo = ~29 GB.
+#   allow_patterns restricts it to only the subfolder reconstruction.py actually uses.
+#
+# WHY cache_dir (not local_dir)?
+#   from_pretrained() in reconstruction.py uses cache_dir to find weights.
+#   snapshot_download must use the same cache_dir so files are found without re-download.
+
+hunyuan_cache = "/content/models/hunyuan3d"
 hunyuan_gdrive = f"{GDRIVE_CACHE}/hunyuan3d"
-if not os.listdir(hunyuan_local):
-    if os.path.exists(hunyuan_gdrive) and os.listdir(hunyuan_gdrive):
-        print("📂 Copying Hunyuan3D-2mv from Google Drive cache...")
-        shutil.copytree(hunyuan_gdrive, hunyuan_local, dirs_exist_ok=True)
-    else:
-        print("⬇️  Downloading Hunyuan3D-2mv from HuggingFace (requires HF_TOKEN + license acceptance)...")
-        from huggingface_hub import snapshot_download
+os.makedirs(hunyuan_cache, exist_ok=True)
+
+# Check if already cached (HF creates model--tencent dirs inside cache_dir)
+import glob
+shape_cached = bool(glob.glob(f"{hunyuan_cache}/models--tencent--Hunyuan3D-2mv/**", recursive=True))
+tex_cached   = bool(glob.glob(f"{hunyuan_cache}/models--tencent--Hunyuan3D-2/**", recursive=True))
+
+if shape_cached and tex_cached:
+    print(f"✅ Hunyuan3D weights already in cache: {hunyuan_cache}")
+elif os.path.exists(hunyuan_gdrive) and os.listdir(hunyuan_gdrive):
+    print("📂 Copying Hunyuan3D from Google Drive cache...")
+    shutil.copytree(hunyuan_gdrive, hunyuan_cache, dirs_exist_ok=True)
+    print(f"✅ Hunyuan3D: copied from Drive cache")
+else:
+    from huggingface_hub import snapshot_download
+
+    if not shape_cached:
+        print("⬇️  Downloading Hunyuan3D shape (hunyuan3d-dit-v2-mv standard, ~10 GB)...")
         snapshot_download(
             repo_id="tencent/Hunyuan3D-2mv",
-            cache_dir=hunyuan_local,
-            token=os.environ["HF_TOKEN"]
+            allow_patterns=["hunyuan3d-dit-v2-mv/**"],
+            cache_dir=hunyuan_cache,
+            token=os.environ["HF_TOKEN"],
         )
-        os.makedirs(hunyuan_gdrive, exist_ok=True)
-        shutil.copytree(hunyuan_local, hunyuan_gdrive, dirs_exist_ok=True)
-        print("💾 Saved Hunyuan3D to Google Drive cache.")
-print(f"✅ Hunyuan3D: {hunyuan_local}")
+        print("✅ Shape downloaded.")
+
+    if not tex_cached:
+        print("⬇️  Downloading Hunyuan3D texture (hunyuan3d-paint-v2-0-turbo, ~6 GB)...")
+        snapshot_download(
+            repo_id="tencent/Hunyuan3D-2",
+            allow_patterns=["hunyuan3d-paint-v2-0-turbo/**"],
+            cache_dir=hunyuan_cache,
+            token=os.environ["HF_TOKEN"],
+        )
+        print("✅ Texture downloaded.")
+
+    os.makedirs(hunyuan_gdrive, exist_ok=True)
+    shutil.copytree(hunyuan_cache, hunyuan_gdrive, dirs_exist_ok=True)
+    print("💾 Saved Hunyuan3D to Google Drive cache.")
+
+print(f"✅ Hunyuan3D cache: {hunyuan_cache}")
 
 
 # =============================================================================
@@ -260,7 +313,7 @@ from src.config import cfg
 from src.gemini_client import GeminiClient
 
 # --- Upload / path ---
-COMPOSITE_IMAGE = "/content/composite.jpg"   # ← change if your filename differs
+COMPOSITE_IMAGE = "/content/41dk3-EPzyL.png"   # ← change if your filename differs
 
 gemini = GeminiClient()
 parse_result = gemini.parse_composite(COMPOSITE_IMAGE)
