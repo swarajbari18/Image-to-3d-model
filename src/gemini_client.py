@@ -23,7 +23,7 @@ Architecture:
   3. validate_amodal(completed_image_path, object_label)
      Two-call approach:
        Call 1 → generate domain-appropriate validation criteria
-       Call 2 → validate the pix2gestalt completion against those criteria
+       Call 2 → validate the SynergyAmodal completion against those criteria
 
   4. lookup_dimensions(object_label)
      Two-call approach:
@@ -165,7 +165,7 @@ class AmodalCriteria(BaseModel):
 
 
 class AmodalValidationResult(BaseModel):
-    """Result of validating a pix2gestalt amodal completion."""
+    """Result of validating a SynergyAmodal amodal completion."""
 
     score: int = Field(
         description="Quality score 1-10.  ≥7 is considered acceptable for 3D reconstruction."
@@ -374,14 +374,14 @@ class GeminiClient:
         object_label: str,
     ) -> AmodalValidationResult:
         """
-        Validate a pix2gestalt amodal completion in two API calls.
+        Validate a SynergyAmodal amodal completion in two API calls.
 
         Call 1: Ask Gemini to generate domain-appropriate validation criteria
                 (what features should the completed back panel have?).
         Call 2: Show the completed image and validate against those criteria.
 
         Args:
-            completed_image_path: Path to the pix2gestalt RGBA output image.
+            completed_image_path: Path to the SynergyAmodal RGBA output image.
             object_label:         Product description, e.g. 'Samsung Galaxy S25 Ultra back panel'.
 
         Returns:
