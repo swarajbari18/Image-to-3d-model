@@ -134,17 +134,14 @@ class PipelineConfig:
         )
     )
 
-    # --- pix2gestalt ---
-    PIX2GESTALT_REPO_DIR: Path = field(
-        default_factory=lambda: Path("/content/pix2gestalt")
+    # --- SynergyAmodal ---
+    SYNERGYAMODAL_REPO_DIR: Path = field(
+        default_factory=lambda: Path("/content/SynergyAmodal")
     )
-    PIX2GESTALT_CKPT_DIR: Path = field(
+    SYNERGYAMODAL_CKPT_DIR: Path = field(
         default_factory=lambda: Path(
-            _get_secret("PIX2GESTALT_CKPT_DIR") or "/content/models/pix2gestalt"
+            _get_secret("SYNERGYAMODAL_CKPT_DIR") or "/content/models/synergyamodal"
         )
-    )
-    PIX2GESTALT_EPOCH: str = field(
-        default_factory=lambda: _get_secret("PIX2GESTALT_EPOCH") or "000005"
     )
 
     # --- Hunyuan3D ---
@@ -174,7 +171,7 @@ class PipelineConfig:
         # Create output directories
         self.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         self.SAM2_CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-        self.PIX2GESTALT_CKPT_DIR.mkdir(parents=True, exist_ok=True)
+        self.SYNERGYAMODAL_CKPT_DIR.mkdir(parents=True, exist_ok=True)
         self.HUNYUAN3D_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
         # Inject HF env-vars BEFORE any transformers/diffusers import
@@ -200,9 +197,14 @@ class PipelineConfig:
         return self.SAM2_CHECKPOINT_DIR / f"sam2.1_hiera_{self.SAM2_VARIANT}.pt"
 
     @property
-    def pix2gestalt_ckpt_path(self) -> Path:
-        """Full path to the pix2gestalt .ckpt file."""
-        return self.PIX2GESTALT_CKPT_DIR / f"epoch={self.PIX2GESTALT_EPOCH}.ckpt"
+    def synergyamodal_ldm_ckpt(self) -> Path:
+        """Full path to SynergyAmodal LDM checkpoint."""
+        return self.SYNERGYAMODAL_CKPT_DIR / "ldm.ckpt"
+
+    @property
+    def synergyamodal_vae_ckpt(self) -> Path:
+        """Full path to SynergyAmodal VAE/RGBA-decoder checkpoint."""
+        return self.SYNERGYAMODAL_CKPT_DIR / "vae.ckpt"
 
     @property
     def sam2_config_name(self) -> str:

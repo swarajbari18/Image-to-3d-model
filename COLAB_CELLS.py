@@ -67,79 +67,52 @@ get_ipython().system("nvidia-smi --query-gpu=name,memory.total --format=csv,nohe
 
 
 # =============================================================================
-# CELL 4 — Install pix2gestalt (clone + deps)
+# CELL 4 — Install SynergyAmodal (clone + deps)
 # =============================================================================
-# RCA: The repo structure is:
-#   /content/pix2gestalt/          ← repo root (README.md, LICENSE, assets/, .git/)
-#   /content/pix2gestalt/pix2gestalt/  ← actual Python package (inference.py, requirements.txt)
+# SynergyAmodal (arxiv 2504.19506) is the amodal completion model.
+# It replaces pix2gestalt — modern deps (torch 2.2, diffusers 0.31),
+# text-conditioned, no 15.5 GB checkpoint, no SAM1 dependency.
 #
-# The requirements.txt is at  /content/pix2gestalt/pix2gestalt/requirements.txt
-# NOT at the repo root — that is why the original cell failed.
-#
-# The README's install steps (cd pix2gestalt; pip install -r requirements.txt)
-# assume you are already INSIDE the cloned directory when you run that command.
-# taming-transformers and CLIP must be cloned INSIDE the pix2gestalt repo dir
-# (i.e. /content/pix2gestalt/) per the official README.
+# Weights: ldm.ckpt + vae.ckpt downloaded in Cell 6 from HuggingFace.
 
 import os, sys
 
-# --- Clone pix2gestalt ---
-if not os.path.exists("/content/pix2gestalt"):
-    get_ipython().system("git clone https://github.com/cvlab-columbia/pix2gestalt.git /content/pix2gestalt")
-    print("✅ pix2gestalt cloned.")
+# --- Clone SynergyAmodal ---
+if not os.path.exists("/content/SynergyAmodal"):
+    get_ipython().system("git clone https://github.com/imlixinyang/SynergyAmodal.git /content/SynergyAmodal")
+    print("✅ SynergyAmodal cloned.")
 else:
-    print("✅ pix2gestalt already present — skipping clone.")
+    print("✅ SynergyAmodal already present — skipping clone.")
 
-# Verify repo structure
-import os
-items = os.listdir("/content/pix2gestalt")
-print(f"   Repo root contents: {items}")
-inner = os.listdir("/content/pix2gestalt/pix2gestalt") if os.path.isdir("/content/pix2gestalt/pix2gestalt") else []
-print(f"   pix2gestalt/ subdir contents: {inner}")
-
-# --- Install pix2gestalt Python dependencies (FILTERED) ---
-# pix2gestalt's requirements.txt pins several packages that conflict with
-# what Colab and our pipeline already have installed.  We filter them out:
-#
-#  SKIPPED (reason):
-#   torch==1.12.1       — CUDA 11.3 wheel no longer on PyPI; Colab has torch 2.x ✓
-#   torchvision==0.13.1 — paired with old torch; skip
-#   diffusers==0.12.1   — would DOWNGRADE to 2022 version; we need >=0.36.0 for SD inpainting
-#   transformers==4.22.2 — would DOWNGRADE; we need >=4.45.0 for SAM2/Hunyuan3D
-#   Pillow==9.5.0       — Colab has newer; strict pin causes conflicts
-#   opencv-python       — conflicts with opencv-python-headless already installed
-#   gradio              — not needed in our pipeline
-#   carvekit-colab      — not needed
-#
-#  INSTALLED (safe, no conflicts):
-#   segment-anything==1.0   ← KEY: inference.py imports this at module level
-#   pytorch-lightning, omegaconf, einops, kornia, torchmetrics, imageio,
-#   test-tube, webdataset, fire, lovely-numpy, lovely-tensors, albumentations,
-#   torch-fidelity, plotly, rich
-
-print("Installing pix2gestalt safe dependencies (skipping conflicting packages)...")
+# --- Install SynergyAmodal requirements ---
+# requirements.txt uses modern compatible versions — install as-is.
+# Only skip gradio (not needed in pipeline) to save install time.
 get_ipython().system(
     "pip install -q "
-    "segment-anything==1.0 "          # SAM1 — imported at module level in inference.py
-    "omegaconf==2.1.1 "
-    "einops==0.3.0 "
-    "pytorch-lightning==1.4.2 "
-    "kornia==0.6 "
-    "torchmetrics==0.6.0 "
-    "imageio==2.9.0 "
-    "imageio-ffmpeg==0.4.2 "
-    "test-tube "
-    "webdataset==0.2.5 "
-    "fire==0.4.0 "
-    "albumentations==0.4.3 "
-    "torch-fidelity==0.3.0 "
-    "lovely-numpy "
-    "lovely-tensors "
-    "plotly==5.13.1 "
-    "fastapi==0.103.2 "
-    "rich"
+    "accelerate==1.0.1 "
+    "addict==2.4.0 "
+    "diffusers==0.31.0 "
+    "easydict==1.13 "
+    "numpy==1.26.4 "
+    "omegaconf==2.3.0 "
+    "onnxruntime==1.22.0 "
+    "pycocotools==2.0.8 "
+    "pytorch_lightning==2.5.0 "
+    "transformers==4.45.0"
 )
-print("✅ pix2gestalt safe deps installed.")
+
+# --- Add to sys.path so imports work at runtime ---
+if "/content/SynergyAmodal" not in sys.path:
+    sys.path.insert(0, "/content/SynergyAmodal")
+
+# --- Verify core imports ---
+try:
+    from omegaconf import OmegaConf
+    from addict import Dict
+    print("✅ SynergyAmodal deps importable — Cell 4 complete.")
+except ImportError as e:
+    print(f"⚠️  Import check failed: {e}")
+
 
 
 # =============================================================================
@@ -176,15 +149,15 @@ else:
 # =============================================================================
 # CELL 6 — Download model weights
 # =============================================================================
-# SAM2:      ~224 MB — Meta CDN, no token
-# pix2gestalt: ~15.5 GB — Columbia server, no token  ⚠️ Takes 10-15 min
+# SAM2:           ~224 MB — Meta CDN, no token
+# SynergyAmodal:  ~5-8 GB — HuggingFace, no token
 # Hunyuan3D: ~8-10 GB  — HuggingFace, HF_TOKEN required
 
 import os, shutil
 from pathlib import Path
 
 os.makedirs("/content/models/sam2", exist_ok=True)
-os.makedirs("/content/models/pix2gestalt", exist_ok=True)
+os.makedirs("/content/models/synergyamodal", exist_ok=True)
 os.makedirs("/content/models/hunyuan3d", exist_ok=True)
 
 GDRIVE_CACHE = "/content/drive/MyDrive/model_cache"
@@ -204,21 +177,27 @@ if not os.path.exists(sam2_ckpt):
         shutil.copy(sam2_ckpt, sam2_gdrive)
 print(f"✅ SAM2: {sam2_ckpt}")
 
-# --- pix2gestalt (~15.5 GB) ---
-p2g_ckpt = "/content/models/pix2gestalt/epoch=000005.ckpt"
-p2g_gdrive = f"{GDRIVE_CACHE}/pix2gestalt/epoch=000005.ckpt"
-if not os.path.exists(p2g_ckpt):
-    if os.path.exists(p2g_gdrive):
-        print("📂 Copying pix2gestalt checkpoint from Google Drive cache (~15.5 GB, may take 5 min)...")
-        os.makedirs("/content/models/pix2gestalt", exist_ok=True)
-        shutil.copy(p2g_gdrive, p2g_ckpt)
+# --- SynergyAmodal weights (ldm.ckpt + vae.ckpt, ~5-8 GB total) ---
+sa_ckpt_dir = "/content/models/synergyamodal"
+sa_gdrive   = f"{GDRIVE_CACHE}/synergyamodal"
+os.makedirs(sa_ckpt_dir, exist_ok=True)
+
+ldm_ckpt = f"{sa_ckpt_dir}/ldm.ckpt"
+vae_ckpt = f"{sa_ckpt_dir}/vae.ckpt"
+
+if not os.path.exists(ldm_ckpt) or not os.path.exists(vae_ckpt):
+    if os.path.exists(sa_gdrive) and os.listdir(sa_gdrive):
+        print("📂 Copying SynergyAmodal weights from Google Drive cache...")
+        import shutil; shutil.copytree(sa_gdrive, sa_ckpt_dir, dirs_exist_ok=True)
     else:
-        print("⬇️  Downloading pix2gestalt epoch=000005 (~15.5 GB, may take 10-15 min)...")
-        get_ipython().system(f"wget -c -O {p2g_ckpt} https://gestalt.cs.columbia.edu/assets/epoch=000005.ckpt")
-        os.makedirs(f"{GDRIVE_CACHE}/pix2gestalt", exist_ok=True)
-        shutil.copy(p2g_ckpt, p2g_gdrive)
-        print("💾 Saved pix2gestalt checkpoint to Google Drive cache.")
-print(f"✅ pix2gestalt: {p2g_ckpt}")
+        print("⬇️  Downloading SynergyAmodal weights from HuggingFace (~5-8 GB)...")
+        from huggingface_hub import hf_hub_download
+        hf_hub_download(repo_id="imlixinyang/SynergyAmodal", filename="ldm.ckpt", local_dir=sa_ckpt_dir)
+        hf_hub_download(repo_id="imlixinyang/SynergyAmodal", filename="vae.ckpt", local_dir=sa_ckpt_dir)
+        os.makedirs(sa_gdrive, exist_ok=True)
+        import shutil; shutil.copytree(sa_ckpt_dir, sa_gdrive, dirs_exist_ok=True)
+        print("💾 Saved SynergyAmodal weights to Google Drive cache.")
+print(f"✅ SynergyAmodal: {ldm_ckpt}, {vae_ckpt}")
 
 # --- Hunyuan3D-2mv (~8-10 GB) ---
 hunyuan_local = "/content/models/hunyuan3d"
@@ -263,11 +242,10 @@ if REPO_DIR not in sys.path:
 
 # Set environment overrides for Colab paths
 os.environ["SAM2_CHECKPOINT_DIR"]    = "/content/models/sam2"
-os.environ["PIX2GESTALT_CKPT_DIR"]   = "/content/models/pix2gestalt"
+os.environ["SYNERGYAMODAL_CKPT_DIR"] = "/content/models/synergyamodal"
 os.environ["HUNYUAN3D_CACHE_DIR"]    = "/content/models/hunyuan3d"
 os.environ["OUTPUT_DIR"]             = "/content/output"
 os.environ["SAM2_VARIANT"]           = "large"
-os.environ["PIX2GESTALT_EPOCH"]      = "000005"
 
 print("✅ Environment configured.")
 
@@ -354,10 +332,10 @@ if dimensions.source_note:
 
 
 # =============================================================================
-# CELL 11 — Stage 4: pix2gestalt amodal completion
+# CELL 11 — Stage 4: SynergyAmodal amodal completion
 # =============================================================================
 # ⚠️  SAM2 must be unloaded before this cell runs (ModelManager handles this automatically).
-# ⚠️  This cell loads ~10 GB to VRAM — takes 3-5 min per seed × 4 seeds = ~15-20 min.
+# ⚠️  This cell loads ~10 GB to VRAM — takes 1-2 min per seed × 4 seeds = ~5-10 min.
 
 from PIL import Image
 from src.amodal_completion import run_amodal
@@ -370,7 +348,6 @@ amodal_result = run_amodal(
     object_label=parse_result.product_label,
     gemini=gemini,
     seeds=[1, 2, 3, 4],
-    steps=50,
     apply_inpaint_if_needed=True,
 )
 
@@ -399,7 +376,7 @@ display(amodal_result.best_candidate)
 # =============================================================================
 # CELL 12 — Stage 5: Hunyuan3D-2mv 3D reconstruction
 # =============================================================================
-# ⚠️  pix2gestalt must be unloaded. ModelManager handles this automatically.
+# ⚠️  SynergyAmodal must be unloaded. ModelManager handles this automatically.
 # ⚠️  Shape stage: ~6 GB. Texture stage: ~10-14 GB. Never both at once.
 
 from src.reconstruction import run_reconstruction

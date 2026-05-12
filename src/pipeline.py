@@ -10,7 +10,7 @@ Architecture:
     1. Gemini parse composite         → CompositeParseResult
     2. SAM2 segmentation              → SegmentationResult  (front_mask, back_modal_mask, RGBAs)
     3. Gemini lookup dimensions       → ProductDimensions   (mm specs from web search)
-    4. pix2gestalt amodal completion  → AmodalResult        (completed back RGBA)
+    4. SynergyAmodal amodal completion → AmodalResult        (completed back RGBA)
     5. Hunyuan3D-2mv reconstruction   → ReconstructionResult (raw GLB)
     6. Mesh processing                → MeshProcessingResult (final phone_final.glb)
 
@@ -51,7 +51,7 @@ class PipelineResult:
         parse_result:       Gemini's scene understanding of the composite.
         segmentation:       SAM2 masks and RGBA crops.
         dimensions:         Real-world mm dimensions from Gemini grounded search.
-        amodal:             pix2gestalt amodal completion of back panel.
+        amodal:             SynergyAmodal amodal completion of back panel.
         reconstruction:     Raw GLB from Hunyuan3D-2mv or TRELLIS.
         mesh:               Final cleaned, oriented, scaled GLB.
         elapsed_seconds:    Total wall-clock time for the pipeline run.
@@ -70,7 +70,6 @@ def run_pipeline(
     composite_image_path: str | Path,
     target_faces: int = 40_000,
     amodal_seeds: int = 4,
-    amodal_steps: int = 50,
 ) -> PipelineResult:
     """
     Run the complete Image-to-3D pipeline on a marketing composite image.
@@ -79,8 +78,7 @@ def run_pipeline(
         composite_image_path: Path to the input image (JPEG or PNG).
                               Should show front + back panel side-by-side.
         target_faces:         Target triangle count for the final GLB.
-        amodal_seeds:         Number of pix2gestalt seeds to try (1-4).
-        amodal_steps:         Denoising steps for pix2gestalt (50=full, 20=fast).
+        amodal_seeds:         Number of SynergyAmodal seeds to try (1-4).
 
     Returns:
         PipelineResult with all intermediate + final outputs.
@@ -139,7 +137,7 @@ def run_pipeline(
 
     # ── Stage 4: Amodal completion ───────────────────────────────────────────
     print("\n" + "=" * 60)
-    print("  STAGE 4: pix2gestalt amodal completion")
+    print("  STAGE 4: SynergyAmodal amodal completion")
     print("=" * 60)
     from PIL import Image
 
@@ -150,7 +148,6 @@ def run_pipeline(
         object_label=parse_result.product_label,
         gemini=gemini,
         seeds=list(range(1, amodal_seeds + 1)),
-        steps=amodal_steps,
     )
     amodal_result.dimensions = dimensions
 

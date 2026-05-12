@@ -9,7 +9,7 @@ Architecture:
       # ← model is automatically moved to CPU, deleted, and VRAM freed
 
   This mirrors the "Sequential Pipeline Memory Budget" from model_caching_research.md:
-      SAM2 (~1.5 GB) → unload → pix2gestalt (~10 GB) → unload → Hunyuan3D (~10-14 GB)
+      SAM2 (~1.5 GB) → unload → SynergyAmodal (~10 GB) → unload → Hunyuan3D (~10-14 GB)
 
   assert_vram_available() uses torch.cuda.mem_get_info() (CUDA driver),
   NOT torch.cuda.memory_allocated() (PyTorch pool).  The driver view is
@@ -41,7 +41,7 @@ class ModelManager:
     # Approximate VRAM (MB) each model requires — used for pre-flight checks.
     VRAM_REQUIREMENTS: dict[str, float] = {
         "sam2": 1_600,
-        "pix2gestalt": 10_000,
+        "synergyamodal": 10_000,
         "sd_inpaint": 5_000,
         "hunyuan3d_shape": 6_500,
         "hunyuan3d_texture": 14_000,

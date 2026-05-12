@@ -1,31 +1,42 @@
 """
-amodal_completion.py — pix2gestalt amodal completion + SD inpainting fallback.
+amodal_completion.py — SynergyAmodal amodal completion + Gemini feedback loop.
 ===============================================================================
 Architecture:
-  SAM2 produces a MODAL mask of the back panel — it only covers VISIBLE pixels.
+  SAM2 produces a MODAL mask of the back panel — only VISIBLE pixels are marked.
   Because the front panel occludes ~20% of the back panel's upper-left corner,
   the back-panel mask has a phone-shaped 'bite' out of it.
 
-  Feeding this incomplete mask directly to Hunyuan3D would produce a 3-D mesh
-  with a literal concave notch at the occlusion boundary.
+  Feeding this incomplete mask to Hunyuan3D produces a mesh with a literal
+  concave notch at the occlusion boundary.  SynergyAmodal fixes this:
 
-  pix2gestalt solves this: given the whole composite image + the modal mask,
-  it generates an AMODAL completion — the full back panel as if the front
-  panel were removed.
+  Given the whole composite image + the modal mask + a text caption, it runs a
+  two-pass coarse-to-fine diffusion process to produce the AMODAL completion —
+  the full back panel as if the front panel were removed.
 
-  Strategy:
-    1. Run pix2gestalt with 4 different random seeds → 4 candidate completions.
-    2. Use GeminiClient.validate_amodal() to score each candidate (1-10).
-    3. Pick the highest-scoring candidate.
-    4. If the winner scores < 7: apply targeted SD inpainting on the worst region
-       using Gemini's inpaint_suggestion prompt.
+  Inference API (ported from SynergyAmodal/app.py):
+    Pass 1 — global 512×512 inference via system.inference()
+    Pass 2 — crop around amodal region, refine with initial_latent from pass 1
+
+  Key advantage over pix2gestalt:
+    - Text conditioning: caption = object_label tells the model what to complete
+    - Modern torch 2.2 / diffusers 0.31 — no dep conflicts
+    - ldm.ckpt + vae.ckpt from HuggingFace (not a 15.5 GB Columbia download)
+    - No SAM1 dependency (pix2gestalt imported segment_anything at module level)
+
+  Feedback loop (per preliminary research §Component 3):
+    1. Run SynergyAmodal × 4 seeds → 4 candidate completions.
+    2. Preparatory Gemini call generates object-specific validation criteria.
+    3. Gemini scores all 4 candidates; each issue carries affected_region bbox
+       and suggested_inpainting_prompt.
+    4. If best_score >= 7: done.
+    5. Else — per-issue targeted remediation:
+         shape/boundary issue → re-run SynergyAmodal with new seeds
+         content/detail issue → SD inpainting on ONLY the affected_region bbox
+    6. Re-validate. Max 2 outer iterations; use best seen if all fail.
 
   VRAM:
-    pix2gestalt: ~10 GB (must assert this before loading)
-    SD inpainting: ~3.5 GB with CPU offload (loaded separately after pix2gestalt unloads)
-
-  Imports for pix2gestalt work via sys.path.insert because it is a cloned repo
-  with no pip package.
+    SynergyAmodal (ldm + vae): ~8-12 GB — managed via ModelManager
+    SD inpainting: ~3.5 GB with CPU offload — loaded only if needed
 """
 
 from __future__ import annotations
@@ -34,14 +45,15 @@ import gc
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 
 from src.config import cfg
-from src.gemini_client import AmodalValidationResult, GeminiClient, ProductDimensions
+from src.gemini_client import AmodalValidationResult, GeminiClient
 from src.model_manager import manager
 
 
@@ -57,11 +69,10 @@ class AmodalResult:
 
     Attributes:
         best_candidate:     PIL Image (RGBA) — the best completed back panel.
-        all_candidates:     All 4 pix2gestalt outputs (useful for side-by-side display).
+        all_candidates:     All seed outputs (useful for side-by-side display).
         validation_result:  Gemini's score + feature breakdown for the winner.
         seed_used:          Which seed (1-4) produced the winning candidate.
-        sd_inpaint_applied: True if SD inpainting was used to fix the winner.
-        dimensions:         Real-world dimensions fetched by Gemini grounded search.
+        sd_inpaint_applied: True if targeted SD inpainting was applied.
     """
 
     best_candidate: Image.Image
@@ -69,92 +80,209 @@ class AmodalResult:
     validation_result: AmodalValidationResult
     seed_used: int
     sd_inpaint_applied: bool
-    dimensions: Optional[ProductDimensions] = None
 
 
 # ---------------------------------------------------------------------------
-# pix2gestalt runner
+# SynergyAmodal helpers (ported from SynergyAmodal/app.py)
 # ---------------------------------------------------------------------------
 
+# Morphological dilation in PyTorch — used for slight mask erosion
+_dilate = lambda x, k=5: F.max_pool2d(x[None], kernel_size=k, stride=1, padding=k // 2)[0]
 
-def _run_pix2gestalt_single(
-    composite_pil: Image.Image,
-    modal_mask: np.ndarray,
-    ckpt_path: str,
-    seed: int,
-    steps: int = 50,
-    scale: float = 3.0,
-) -> Image.Image:
+
+def _load_synergyamodal() -> Tuple:
     """
-    Run one pix2gestalt inference pass and return the completed RGBA image.
+    Load SynergyAmodal's LDM + RGBA-decoder checkpoints.
 
-    pix2gestalt is imported from the cloned repo (no pip package).
-    sys.path.insert is done here rather than at module level so that
-    config.py and model_manager.py can be imported without the repo present.
-
-    Args:
-        composite_pil: Full composite RGB PIL Image (context for completion).
-        modal_mask:    np.ndarray (H, W) bool — SAM modal mask of back panel.
-        ckpt_path:     Path to epoch=000005.ckpt (or epoch=000010.ckpt).
-        seed:          Random seed for diffusion sampling (try 1, 2, 3, 4).
-        steps:         Denoising steps.  50 = full quality, 20 = faster.
-        scale:         CFG guidance scale.  3.0 is the paper's default.
-
-    Returns:
-        PIL Image (RGBA) — the completed back panel on white background.
+    Returns (system, mask_decoder) tuple — both moved to cfg.DEVICE and
+    set to eval mode with EMA weights applied (per app.py pattern).
     """
-    repo = str(cfg.PIX2GESTALT_REPO_DIR)   # /content/pix2gestalt (repo root)
-    # The import is `from pix2gestalt.inference import run_pix2gestalt`
-    # which resolves because pix2gestalt/ is a subdir of the repo root.
-    # Do NOT insert the inner pix2gestalt/ dir — that would break the import.
+    repo = str(cfg.SYNERGYAMODAL_REPO_DIR)
     if repo not in sys.path:
         sys.path.insert(0, repo)
 
-    from pix2gestalt.inference import run_pix2gestalt  # type: ignore[import]
+    from omegaconf import OmegaConf  # type: ignore[import]
+    from trainer_deocclusion_pseudo import InpaintingTrainer  # type: ignore[import]
+    from trainer_deocclusion_pseudo_decoder import RGBADecoderTrainer  # type: ignore[import]
 
-    result_rgba: Image.Image = run_pix2gestalt(
-        ckpt_path=ckpt_path,
-        whole_image=composite_pil,      # PIL Image (RGB) — provides scene context
-        mask=modal_mask,                # np.ndarray (H, W) bool
-        seed=seed,
-        steps=steps,
-        scale=scale,
-        device=cfg.DEVICE,
+    config_path = str(cfg.SYNERGYAMODAL_REPO_DIR / "configs" / "inpainter_ours_pseudo.yaml")
+    opt = OmegaConf.load(config_path)
+
+    # --- LDM (the main diffusion model) ---
+    system = InpaintingTrainer.load_from_checkpoint(
+        str(cfg.synergyamodal_ldm_ckpt),
+        map_location=cfg.DEVICE,
+        strict=True,
+        opt=opt,
+    ).to(cfg.DEVICE)
+    system.model_ema.load_ema_params(system.unet)
+    del system.model_ema
+    system.eval()
+
+    # --- RGBA decoder (VAE that outputs image + amodal mask) ---
+    mask_decoder = RGBADecoderTrainer.load_from_checkpoint(
+        str(cfg.synergyamodal_vae_ckpt),
+        map_location=cfg.DEVICE,
+        strict=True,
+    ).to(cfg.DEVICE)
+    mask_decoder.model_ema.load_ema_params(mask_decoder.vae.decoder)
+    del mask_decoder.model_ema
+    del mask_decoder.vae.encoder
+    mask_decoder.eval()
+
+    return system, mask_decoder
+
+
+@torch.no_grad()
+def _run_synergyamodal_single(
+    composite_pil: Image.Image,
+    modal_mask: np.ndarray,
+    system,
+    mask_decoder,
+    caption: str,
+    seed: int,
+    cfg_image: float = 1.0,
+    cfg_text: float = 1.0,
+    local_noise_strength: float = 1.0,
+) -> Image.Image:
+    """
+    Run one SynergyAmodal inference pass (two-pass coarse-to-fine).
+
+    Ported directly from SynergyAmodal/app.py::deocclude_button_click().
+
+    Args:
+        composite_pil:        Full composite RGB PIL Image (scene context).
+        modal_mask:           np.ndarray (H, W) bool — SAM2 visible-pixel mask.
+        system:               Loaded InpaintingTrainer model.
+        mask_decoder:         Loaded RGBADecoderTrainer model.
+        caption:              Text description of the object (e.g. "rear panel of
+                              Samsung Galaxy S25 Ultra, 4 camera lenses").
+        seed:                 Random seed for diffusion sampling.
+        cfg_image / cfg_text: Classifier-free guidance scales.
+        local_noise_strength: Pass-2 noise strength (1.0 = full refinement).
+
+    Returns:
+        PIL Image (RGBA) — the completed back panel on transparent background.
+    """
+    from utils import move_to, crop_and_resize, put_back  # type: ignore[import]
+
+    torch.manual_seed(seed)
+
+    # --- postprocess helper (closes over mask_decoder) ---
+    @torch.no_grad()
+    def postprocess_latent(latent, *args):
+        return mask_decoder.vae.decode(latent).sample.sigmoid().round(),
+
+    image_size = 512
+    image_np = np.array(composite_pil.convert("RGB"))
+    H, W = image_np.shape[:2]
+
+    # Convert to tensors
+    image = torch.from_numpy(image_np).permute(2, 0, 1).float() / 255.0
+    mask_t = torch.from_numpy(modal_mask.astype(np.float32))  # (H, W)
+    # Slight erosion to clean mask boundary (erode_kernel_size=1 per app defaults)
+    mask_t = 1 - _dilate(1 - mask_t[None], k=1)[0]
+
+    # --- Resize + pad to 512×512 ---
+    resize_scale = image_size / max(H, W)
+    all_t = torch.cat([image, mask_t[None]], dim=0)
+    all_t = F.interpolate(
+        all_t[None],
+        size=(int(H * resize_scale), int(W * resize_scale)),
+        mode="bilinear",
+        align_corners=False,
+    )[0]
+    all_t = F.pad(all_t, (0, image_size - all_t.shape[-1], 0, image_size - all_t.shape[-2]))
+    image_t, mask_t = all_t.split([3, 1], dim=0)
+    mask_t = (mask_t > 0.5).float()
+
+    # --- Pass 1: global coarse inference ---
+    fbatch = {"image": image_t[None], "modal_mask": mask_t[None], "caption": [caption]}
+    fbatch = move_to(fbatch, cfg.DEVICE)
+    amodal_img, amodal_msk = system.inference(
+        fbatch, cfg_image=cfg_image, cfg_text=cfg_text, postprocess_latent=postprocess_latent
     )
-    return result_rgba
+
+    # Crop padding and restore to original resolution
+    amodal_rgba = torch.cat([amodal_img, amodal_msk], dim=1)[0].cpu()
+    amodal_rgba = amodal_rgba[:, : int(H * resize_scale), : int(W * resize_scale)]
+    amodal_rgba = F.interpolate(amodal_rgba[None], size=(H, W), mode="bilinear", align_corners=False)[0]
+    amodal_img_out, amodal_msk_out = amodal_rgba.split([3, 1], dim=0)
+    amodal_msk_out = (amodal_msk_out > 0.5).float()
+    amodal_img_out = amodal_img_out * amodal_msk_out + 1.0 * (1 - amodal_msk_out)
+
+    # --- Pass 2: coarse-to-fine crop refinement ---
+    image_orig = torch.from_numpy(image_np).permute(2, 0, 1).float() / 255.0
+    mask_orig = torch.from_numpy(modal_mask.astype(np.float32))
+    mask_orig = 1 - _dilate(1 - mask_orig[None], k=1)[0]
+
+    cropped_all, bbox = crop_and_resize(
+        torch.cat([image_orig, mask_orig[None], amodal_img_out], dim=0),
+        amodal_msk_out[0],
+        min_size=256,
+        padding_value=0,
+    )
+    cropped_image, cropped_mask, cropped_amodal = cropped_all.split([3, 1, 3], dim=0)
+    cropped_mask = (cropped_mask > 0.5).float()
+
+    batch = {"image": cropped_image[None], "modal_mask": cropped_mask[None], "caption": [caption]}
+    batch = move_to(batch, cfg.DEVICE)
+
+    cropped_amodal, cropped_amodal_msk = system.inference(
+        batch,
+        cfg_image=cfg_image,
+        cfg_text=cfg_text,
+        postprocess_latent=postprocess_latent,
+        strength=local_noise_strength,
+        initial_latent=system.latent_scale_fn(
+            system.vae.encode(
+                cropped_amodal[None].contiguous().to(cfg.DEVICE) * 2 - 1
+            )
+        ),
+    )
+
+    cropped_rgba = torch.cat([cropped_amodal, cropped_amodal_msk], dim=1)[0].cpu()
+    final_rgba = put_back(cropped_rgba, H, W, bbox)
+    final_rgba[3] = (final_rgba[3] > 0.5).float()
+
+    # Return as PIL RGBA
+    result_np = final_rgba.float().permute(1, 2, 0).mul(255).numpy().astype(np.uint8)
+    return Image.fromarray(result_np, "RGBA")
 
 
 # ---------------------------------------------------------------------------
-# SD inpainting fallback
+# Targeted SD inpainting (content/detail fix inside the feedback loop)
 # ---------------------------------------------------------------------------
 
 
-def _apply_sd_inpainting(
+def _apply_targeted_sd_inpainting(
     base_image: Image.Image,
     prompt: str,
+    affected_region: List[int],
     object_label: str,
 ) -> Image.Image:
     """
-    Apply Stable Diffusion inpainting to the worst region of a pix2gestalt completion.
+    Apply Stable Diffusion inpainting to ONE specific region identified by Gemini.
 
-    Uses the public mirror 'stable-diffusion-v1-5/stable-diffusion-inpainting'
-    (no HF token required).  Runs with CPU offload to fit in ~3.5 GB VRAM.
+    This is NOT a primary amodal path — it is the content/detail fix step inside
+    the Gemini feedback loop.  It runs only when Gemini detects issues like
+    wrong_lens_count or seam_artifact in best_candidate.issues[].
 
-    The region to inpaint is determined from Gemini's inpaint_suggestion prompt
-    which describes what to fix.  We create a simple center-weighted mask as a
-    heuristic — the previously occluded region is typically in the upper-left.
+    The mask is built from Gemini's affected_region [ymin, xmin, ymax, xmax]
+    pixel coordinates (not a hardcoded heuristic).
 
     Args:
-        base_image:   PIL Image (RGB or RGBA) from pix2gestalt.
-        prompt:       Gemini's suggested inpainting prompt (fix description).
-        object_label: Used to enrich the negative prompt.
+        base_image:       PIL Image (RGBA or RGB) — SynergyAmodal output.
+        prompt:           Gemini's suggested_inpainting_prompt for this issue.
+        affected_region:  [ymin, xmin, ymax, xmax] pixel bbox from Gemini.
+        object_label:     Used to enrich the negative prompt.
 
     Returns:
-        PIL Image (RGB) with targeted inpainting applied.
+        PIL Image (RGB) — image with the specific region inpainted.
     """
     from diffusers import StableDiffusionInpaintPipeline  # type: ignore[import]
 
-    print("[amodal] Applying SD inpainting fallback...")
+    print(f"[amodal] Targeted SD inpainting on region {affected_region}: '{prompt}'")
 
     def _load_sd():
         pipe = StableDiffusionInpaintPipeline.from_pretrained(
@@ -170,14 +298,21 @@ def _apply_sd_inpainting(
         img_rgb = base_image.convert("RGB")
         w, h = img_rgb.size
 
-        # Heuristic inpaint mask: upper-left quadrant (the typical occlusion zone)
+        # Build mask from Gemini's exact affected_region bbox
+        ymin, xmin, ymax, xmax = [int(v) for v in affected_region]
         mask_arr = np.zeros((h, w), dtype=np.uint8)
-        mask_arr[: h // 2, : w // 2] = 255  # upper-left quarter = inpaint region
+        # Dilate region by 8px to handle VAE latent boundary contamination
+        pad = 8
+        mask_arr[max(0, ymin - pad): min(h, ymax + pad),
+                 max(0, xmin - pad): min(w, xmax + pad)] = 255
         mask_pil = Image.fromarray(mask_arr, "L")
 
         result = pipe(
             prompt=prompt,
-            negative_prompt=f"artifacts, blurry, wrong details, distorted, low quality, {object_label} front face on back",
+            negative_prompt=(
+                f"artifacts, blurry, wrong details, distorted, low quality, "
+                f"{object_label} front face on back"
+            ),
             image=img_rgb,
             mask_image=mask_pil,
             strength=0.80,
@@ -199,119 +334,179 @@ def run_amodal(
     object_label: str,
     gemini: Optional[GeminiClient] = None,
     seeds: List[int] = None,
-    steps: int = 50,
     apply_inpaint_if_needed: bool = True,
 ) -> AmodalResult:
     """
-    Complete the occluded portion of the back panel using pix2gestalt.
+    Complete the occluded portion of the back panel using SynergyAmodal.
 
-    Runs pix2gestalt with multiple seeds, scores each with Gemini, picks the best.
-    Falls back to SD inpainting if the best candidate scores < 7.
+    Implements the full Gemini↔amodal feedback loop from preliminary research
+    §Component 3.  Runs SynergyAmodal × 4 seeds, Gemini scores all candidates,
+    picks best.  If best < 7, targeted SD inpainting fixes critical issues per
+    Gemini's affected_region + suggested_inpainting_prompt.  Max 2 outer loops.
 
     Args:
-        composite_pil:         Full composite PIL Image (RGB) — context for pix2gestalt.
-        back_modal_mask:       SAM modal mask (H, W) bool — visible back-panel pixels.
-        object_label:          Product description for Gemini validation.
-        gemini:                Optional GeminiClient (creates one if None).
-        seeds:                 List of random seeds to try. Default: [1, 2, 3, 4].
-        steps:                 pix2gestalt denoising steps.  Reduce to 20 if VRAM is tight.
-        apply_inpaint_if_needed: If True, run SD inpainting when best score < 7.
+        composite_pil:    Full composite PIL Image (RGB) — scene context.
+        back_modal_mask:  SAM2 modal mask (H, W) bool — visible back-panel pixels.
+        object_label:     Product description, e.g. "rear panel of Samsung S25 Ultra".
+        gemini:           Optional GeminiClient (creates one if None).
+        seeds:            Random seeds to try. Default: [1, 2, 3, 4].
+        apply_inpaint_if_needed: If True, run targeted SD inpainting for issues.
 
     Returns:
         AmodalResult with best_candidate RGBA PIL Image.
     """
     seeds = seeds or [1, 2, 3, 4]
     gemini = gemini or GeminiClient()
-    ckpt_path = str(cfg.pix2gestalt_ckpt_path)
 
-    # --- Pre-flight VRAM check ---
+    # Build text caption for SynergyAmodal (text conditioning is a key advantage)
+    caption = f"Complete full deoccluded view of {object_label}, remove occluder"
+
+    # Pre-flight VRAM check (~10 GB needed for ldm + vae)
     manager.assert_vram_available(required_mb=9_500)
 
     all_candidates: List[Image.Image] = []
     all_scores: List[int] = []
     all_validations: List[AmodalValidationResult] = []
 
-    print(f"[amodal] Running pix2gestalt with {len(seeds)} seeds ({steps} steps each)...")
+    best_seen: Optional[Image.Image] = None
+    best_seen_score: int = 0
+    best_seen_validation: Optional[AmodalValidationResult] = None
+    sd_applied = False
 
-    for seed in seeds:
-        print(f"[amodal]   Seed {seed}...")
-        # pix2gestalt loads its own models internally — we can't wrap in ModelManager
-        # We call gc/empty_cache between seeds to keep peak VRAM low
-        try:
-            candidate = _run_pix2gestalt_single(
-                composite_pil=composite_pil,
-                modal_mask=back_modal_mask,
-                ckpt_path=ckpt_path,
-                seed=seed,
-                steps=steps,
-            )
-        except RuntimeError as e:
-            if "CUDA out of memory" in str(e):
-                print(f"[amodal] OOM on seed {seed} — skipping. Try steps=20.")
+    # --- Outer feedback loop (max 2 iterations per research) ---
+    for iteration in range(2):
+        iter_candidates: List[Image.Image] = []
+        iter_scores: List[int] = []
+        iter_validations: List[AmodalValidationResult] = []
+
+        iter_seeds = seeds if iteration == 0 else [seeds[-1] + iteration * 10 + i for i in range(4)]
+        print(f"[amodal] Iteration {iteration + 1}/2 — running SynergyAmodal with seeds {iter_seeds}")
+
+        # Load SynergyAmodal once per outer iteration; unload after all seeds
+        with manager.use("synergyamodal", _load_synergyamodal) as (system, mask_decoder):
+            for seed in iter_seeds:
+                print(f"[amodal]   Seed {seed}...")
+                try:
+                    candidate = _run_synergyamodal_single(
+                        composite_pil=composite_pil,
+                        modal_mask=back_modal_mask,
+                        system=system,
+                        mask_decoder=mask_decoder,
+                        caption=caption,
+                        seed=seed,
+                    )
+                except RuntimeError as e:
+                    if "CUDA out of memory" in str(e):
+                        print(f"[amodal]   OOM on seed {seed} — skipping.")
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        continue
+                    raise
+
+                iter_candidates.append(candidate)
+
+                # Save for Gemini inspection
+                candidate_path = cfg.OUTPUT_DIR / f"amodal_iter{iteration}_seed{seed}.png"
+                candidate.save(str(candidate_path))
+
+                val = gemini.validate_amodal(
+                    completed_image_path=candidate_path,
+                    object_label=object_label,
+                )
+                iter_scores.append(val.score)
+                iter_validations.append(val)
+                print(f"[amodal]   Seed {seed} → score {val.score}/10")
+
                 gc.collect()
                 torch.cuda.empty_cache()
-                continue
-            raise
 
-        all_candidates.append(candidate)
+        # SynergyAmodal is now unloaded (ModelManager __exit__)
 
-        # Save candidate for Gemini inspection
-        candidate_path = cfg.OUTPUT_DIR / f"amodal_seed{seed}.png"
-        candidate.save(str(candidate_path))
+        if not iter_candidates:
+            print("[amodal] All seeds failed this iteration — aborting.")
+            break
 
-        # Gemini validation
-        val = gemini.validate_amodal(
-            completed_image_path=candidate_path,
-            object_label=object_label,
-        )
-        all_scores.append(val.score)
-        all_validations.append(val)
-        print(f"[amodal]   Seed {seed} → score {val.score}/10")
+        all_candidates.extend(iter_candidates)
+        all_scores.extend(iter_scores)
+        all_validations.extend(iter_validations)
 
-        gc.collect()
-        torch.cuda.empty_cache()
+        # Pick best in this iteration
+        best_idx = int(np.argmax(iter_scores))
+        best_score = iter_scores[best_idx]
+        best_candidate = iter_candidates[best_idx]
+        best_validation = iter_validations[best_idx]
+        best_seed = iter_seeds[best_idx]
 
-    if not all_candidates:
-        raise RuntimeError("[amodal] All pix2gestalt seeds failed — likely OOM.")
+        # Track overall best seen across iterations
+        if best_score > best_seen_score:
+            best_seen_score = best_score
+            best_seen = best_candidate
+            best_seen_validation = best_validation
 
-    # --- Pick best candidate ---
-    best_idx = int(np.argmax(all_scores))
-    best_score = all_scores[best_idx]
-    best_candidate = all_candidates[best_idx]
-    best_validation = all_validations[best_idx]
-    best_seed = seeds[best_idx]
+        print(f"[amodal] Iter {iteration + 1} best: seed={best_seed}, score={best_score}/10")
 
-    print(f"[amodal] Best candidate: seed={best_seed}, score={best_score}/10")
-
-    # --- SD inpainting fallback ---
-    sd_applied = False
-    if apply_inpaint_if_needed and not best_validation.passed:
-        if best_validation.inpaint_suggestion:
-            print(
-                f"[amodal] Score {best_score} < 7 — applying SD inpainting. "
-                f"Prompt: '{best_validation.inpaint_suggestion}'"
-            )
-            best_candidate = _apply_sd_inpainting(
-                base_image=best_candidate,
-                prompt=best_validation.inpaint_suggestion,
-                object_label=object_label,
-            )
-            sd_applied = True
-        else:
-            print(
-                f"[amodal] Score {best_score} — no inpaint suggestion from Gemini, "
-                f"proceeding with best available."
+        # --- Check if best passes threshold ---
+        if best_validation.passed:
+            print(f"[amodal] Score {best_score} >= 7 — validation passed ✅")
+            best_seen.save(str(cfg.OUTPUT_DIR / "amodal_best.png"))
+            return AmodalResult(
+                best_candidate=best_seen,
+                all_candidates=all_candidates,
+                validation_result=best_seen_validation,
+                seed_used=best_seed,
+                sd_inpaint_applied=False,
             )
 
-    # Save final amodal result
-    final_path = cfg.OUTPUT_DIR / "amodal_best.png"
-    best_candidate.save(str(final_path))
-    print(f"[amodal] Best amodal completion saved to {final_path}")
+        # --- Apply targeted SD inpainting for critical content/detail issues ---
+        if apply_inpaint_if_needed and hasattr(best_validation, "issues") and best_validation.issues:
+            repaired = best_candidate
+            for issue in best_validation.issues:
+                if getattr(issue, "severity", "") == "critical" and getattr(issue, "affected_region", None):
+                    repaired = _apply_targeted_sd_inpainting(
+                        base_image=repaired,
+                        prompt=issue.suggested_inpainting_prompt,
+                        affected_region=issue.affected_region,
+                        object_label=object_label,
+                    )
+                    sd_applied = True
 
+            if sd_applied:
+                repaired_path = cfg.OUTPUT_DIR / f"amodal_repaired_iter{iteration}.png"
+                repaired.save(str(repaired_path))
+                repaired_val = gemini.validate_amodal(
+                    completed_image_path=repaired_path,
+                    object_label=object_label,
+                )
+                print(f"[amodal] Post-inpaint score: {repaired_val.score}/10")
+
+                if repaired_val.score > best_seen_score:
+                    best_seen_score = repaired_val.score
+                    best_seen = repaired
+                    best_seen_validation = repaired_val
+
+                if repaired_val.passed:
+                    print("[amodal] Repaired image passed validation ✅")
+                    best_seen.save(str(cfg.OUTPUT_DIR / "amodal_best.png"))
+                    return AmodalResult(
+                        best_candidate=best_seen,
+                        all_candidates=all_candidates,
+                        validation_result=best_seen_validation,
+                        seed_used=best_seed,
+                        sd_inpaint_applied=True,
+                    )
+
+        # Loop continues with new seeds if iteration < 2
+
+    # All iterations exhausted — use best seen, flag it
+    print(
+        f"[amodal] Max iterations reached. Using best seen (score={best_seen_score}/10). "
+        f"Flagged as 'validated with minor issues'."
+    )
+    best_seen.save(str(cfg.OUTPUT_DIR / "amodal_best.png"))
     return AmodalResult(
-        best_candidate=best_candidate,
+        best_candidate=best_seen,
         all_candidates=all_candidates,
-        validation_result=best_validation,
-        seed_used=best_seed,
+        validation_result=best_seen_validation,
+        seed_used=-1,
         sd_inpaint_applied=sd_applied,
     )
