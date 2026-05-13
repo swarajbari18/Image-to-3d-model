@@ -175,11 +175,31 @@ def _build_sam2_loader(checkpoint: str, config_name: str, device: str):
     """Return a zero-argument lambda that builds and returns the SAM2 predictor."""
 
     def _load():
+        import os
+        import sam2 as _sam2_module
+        from hydra import initialize_config_dir  # type: ignore[import]
+        from hydra.core.global_hydra import GlobalHydra  # type: ignore[import]
         from sam2.build_sam import build_sam2  # type: ignore[import]
         from sam2.sam2_image_predictor import SAM2ImagePredictor  # type: ignore[import]
 
+        sam2_root = os.path.dirname(_sam2_module.__file__)
+
+        # config_name may be "sam2.1/sam2.1_hiera_l.yaml" (subdir/filename) or
+        # a plain filename.  Split so we can point Hydra at the subdir via a
+        # real filesystem path — pkg://sam2 cannot resolve "sam2.1/" because
+        # the dot makes it an invalid Python package identifier.
+        if "/" in config_name:
+            subdir, fname = config_name.split("/", 1)
+            config_dir = os.path.abspath(os.path.join(sam2_root, "configs", subdir))
+        else:
+            fname = config_name
+            config_dir = os.path.abspath(os.path.join(sam2_root, "configs"))
+
+        GlobalHydra.instance().clear()
         print(f"[segmentation] Building SAM2 from {checkpoint}")
-        model = build_sam2(config_file=config_name, ckpt_path=checkpoint, device=device)
+        with initialize_config_dir(config_dir=config_dir, job_name="sam2_load"):
+            model = build_sam2(config_file=fname, ckpt_path=checkpoint, device=device)
+
         return SAM2ImagePredictor(model)
 
     return _load
