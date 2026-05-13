@@ -137,6 +137,31 @@ def extract_rgba_crop(image_rgb: np.ndarray, mask: np.ndarray) -> Image.Image:
 
 
 # ---------------------------------------------------------------------------
+# Dataclass for mask candidates (inspection step)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class MaskCandidates:
+    """
+    All 3 SAM2 candidate masks for both views, returned by inspect_segmentation_masks().
+
+    Attributes:
+        front_masks:   (3, H, W) bool — three candidate masks for the front view.
+        front_scores:  (3,)      float — SAM2 confidence scores for each front candidate.
+        back_masks:    (3, H, W) bool — three candidate masks for the back view.
+        back_scores:   (3,)      float — SAM2 confidence scores for each back candidate.
+        composite_rgb: (H, W, 3) uint8 — the original composite image array.
+    """
+
+    front_masks: np.ndarray
+    front_scores: np.ndarray
+    back_masks: np.ndarray
+    back_scores: np.ndarray
+    composite_rgb: np.ndarray
+
+
+# ---------------------------------------------------------------------------
 # Dataclass for segmentation results
 # ---------------------------------------------------------------------------
 
@@ -206,6 +231,86 @@ def _build_sam2_loader(checkpoint: str, config_name: str, device: str):
 
 
 # ---------------------------------------------------------------------------
+# Candidate inspection (run before run_segmentation to pick mask indices)
+# ---------------------------------------------------------------------------
+
+
+def inspect_segmentation_masks(
+    composite_path: str | Path,
+    parse_result: CompositeParseResult,
+    save_dir: Optional[str | Path] = None,
+) -> MaskCandidates:
+    """
+    Run SAM2 once and return all 3 candidate masks for both the front and back views.
+
+    SAM2's highest-scoring mask is not always the correct one — this function
+    lets you visually inspect all candidates and pick the right index to pass
+    to run_segmentation() via front_mask_idx / back_mask_idx.
+
+    Saves 6 overlay images (front_candidate_0/1/2.png, back_candidate_0/1/2.png)
+    to save_dir when provided.
+
+    Args:
+        composite_path: Path to the composite image.
+        parse_result:   Result of GeminiClient.parse_composite().
+        save_dir:       Optional directory to save candidate overlay images.
+
+    Returns:
+        MaskCandidates with all 3 masks + scores for each view.
+    """
+    view_map: Dict[str, ObjectView] = {v.label.lower(): v for v in parse_result.views}
+    if "front" not in view_map or "back" not in view_map:
+        raise ValueError(
+            f"parse_result must contain 'front' and 'back' views. "
+            f"Got: {list(view_map.keys())}"
+        )
+
+    composite_pil = Image.open(composite_path).convert("RGB")
+    composite_rgb = np.array(composite_pil)
+    img_h, img_w = composite_rgb.shape[:2]
+
+    sam_box_front = gemini_box_to_sam(view_map["front"].box_2d, img_h, img_w)
+    sam_box_back  = gemini_box_to_sam(view_map["back"].box_2d,  img_h, img_w)
+
+    loader = _build_sam2_loader(
+        checkpoint=str(cfg.sam2_checkpoint_path),
+        config_name=cfg.sam2_config_name,
+        device=cfg.DEVICE,
+    )
+
+    with manager.use("sam2", loader) as predictor:
+        predictor.set_image(composite_rgb)
+
+        import torch
+        with torch.inference_mode():
+            front_masks, front_scores, _ = predictor.predict(
+                box=sam_box_front, multimask_output=True
+            )
+            back_masks, back_scores, _ = predictor.predict(
+                box=sam_box_back, multimask_output=True
+            )
+
+    if save_dir is not None:
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        for i, mask in enumerate(front_masks):
+            overlay = render_mask_overlay(composite_rgb, {"front": mask.astype(bool)})
+            overlay.save(str(save_dir / f"front_candidate_{i}.png"))
+        for i, mask in enumerate(back_masks):
+            overlay = render_mask_overlay(composite_rgb, {"back": mask.astype(bool)})
+            overlay.save(str(save_dir / f"back_candidate_{i}.png"))
+        print(f"[segmentation] Candidate overlays saved to {save_dir}")
+
+    return MaskCandidates(
+        front_masks=front_masks.astype(bool),
+        front_scores=front_scores,
+        back_masks=back_masks.astype(bool),
+        back_scores=back_scores,
+        composite_rgb=composite_rgb,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Core segmentation function
 # ---------------------------------------------------------------------------
 
@@ -216,6 +321,8 @@ def run_segmentation(
     gemini: Optional[GeminiClient] = None,
     max_feedback_iters: int = 3,
     overlay_save_path: Optional[str | Path] = None,
+    front_mask_idx: int = -1,
+    back_mask_idx: int = -1,
 ) -> SegmentationResult:
     """
     Segment front and back panels from a marketing composite image.
@@ -234,6 +341,10 @@ def run_segmentation(
         gemini:            Optional GeminiClient instance (creates one if None).
         max_feedback_iters: Max Gemini-SAM feedback iterations before accepting.
         overlay_save_path: If provided, save the final overlay image here.
+        front_mask_idx:    Which of SAM2's 3 candidates to use for the front view.
+                           -1 (default) = pick highest score automatically.
+                           Use inspect_segmentation_masks() to preview all 3 options.
+        back_mask_idx:     Same as front_mask_idx but for the back view.
 
     Returns:
         SegmentationResult containing masks and RGBA crops.
@@ -298,8 +409,10 @@ def run_segmentation(
                 front_masks, front_scores, _ = predictor.predict(**front_kwargs)
                 back_masks, back_scores, _ = predictor.predict(**back_kwargs)
 
-            front_mask = front_masks[np.argmax(front_scores)]  # (H, W) bool
-            back_mask = back_masks[np.argmax(back_scores)]
+            fi = front_mask_idx if front_mask_idx >= 0 else int(np.argmax(front_scores))
+            bi = back_mask_idx  if back_mask_idx  >= 0 else int(np.argmax(back_scores))
+            front_mask = front_masks[fi]   # (H, W) bool
+            back_mask  = back_masks[bi]
 
             best_masks = {"front": front_mask, "back": back_mask}
 

@@ -44,8 +44,8 @@ print(f"  HF_TOKEN:       {'set ✓' if os.environ.get('HF_TOKEN') else 'MISSING
 # =============================================================================
 # Takes ~3-5 minutes on a fresh Colab session.
 
-# Core HuggingFace + diffusers
-get_ipython().system("pip install -q transformers diffusers accelerate safetensors huggingface_hub")
+# Core HuggingFace + diffusers (transformers is intentionally excluded here — Cell 4 pins it)
+get_ipython().system("pip install -q diffusers accelerate safetensors huggingface_hub")
 
 # Gemini SDK (NEW — google-generativeai is deprecated)
 get_ipython().system("pip install -q google-genai python-dotenv pydantic rich")
@@ -90,6 +90,10 @@ else:
 #   - Drop numpy==1.26.4 pin: Colab's opencv/jax/cupy need numpy>=2; SynergyAmodal's
 #     inference code is compatible with numpy 2.x, so the pin is unnecessary here.
 # xformers is required for memory-efficient attention (per SynergyAmodal README).
+# Install all SynergyAmodal deps — transformers is excluded here and pinned below.
+# torchmetrics is pinned explicitly to 1.6.0 because the pytorch_lightning dep-resolver
+# can otherwise pull a newer torchmetrics that needs transformers>=4.48 (which has
+# removed is_flax_available, causing an ImportError at load time).
 get_ipython().system(
     "pip install -q "
     "accelerate==1.0.1 "
@@ -100,9 +104,14 @@ get_ipython().system(
     "onnxruntime==1.22.0 "
     "pycocotools==2.0.8 "
     "pytorch_lightning==2.5.0 "
-    "transformers==4.45.0"
+    "torchmetrics==1.6.0"
 )
 get_ipython().system("pip install -q xformers")  # required for memory-efficient attention
+
+# Pin transformers LAST with --force-reinstall so no earlier install leaves a partial/mixed
+# version on disk.  4.45.0 is the last release where is_flax_available is still a public
+# export in transformers.utils, which torchmetrics 1.6.0 relies on.
+get_ipython().system("pip install -q --force-reinstall transformers==4.45.0")
 
 # --- Restore numpy>=2 (safety net: some pip solvers may still pull in numpy 1.x) ---
 get_ipython().system('pip install -q "numpy>=2.0"')
@@ -241,22 +250,45 @@ print(f"✅ SynergyAmodal: {ldm_ckpt} ({os.path.getsize(ldm_ckpt)/1e9:.1f} GB), 
 #   from_pretrained() in reconstruction.py uses cache_dir to find weights.
 #   snapshot_download must use the same cache_dir so files are found without re-download.
 
-hunyuan_cache = "/content/models/hunyuan3d"
-hunyuan_gdrive = f"{GDRIVE_CACHE}/hunyuan3d"
+hunyuan_cache  = "/content/models/hunyuan3d"
+hunyuan_gdrive = f"{GDRIVE_CACHE}/hunyuan3d"        # legacy raw-tree path (kept for fallback)
+hunyuan_tar    = f"{GDRIVE_CACHE}/hunyuan3d.tar"    # fast path — single sequential stream
 os.makedirs(hunyuan_cache, exist_ok=True)
 
-# Check if already cached (HF creates model--tencent dirs inside cache_dir)
+# Check if already cached locally (HF creates model--tencent--* dirs inside cache_dir)
 import glob
 shape_cached = bool(glob.glob(f"{hunyuan_cache}/models--tencent--Hunyuan3D-2mv/**", recursive=True))
 tex_cached   = bool(glob.glob(f"{hunyuan_cache}/models--tencent--Hunyuan3D-2.1/**", recursive=True))
 
 if shape_cached and tex_cached:
-    print(f"✅ Hunyuan3D weights already in cache: {hunyuan_cache}")
+    print(f"✅ Hunyuan3D weights already in /content — skipping.")
+
+elif os.path.exists(hunyuan_tar):
+    # Fast path: tarball is a single sequential stream — one Drive API call, no per-file overhead.
+    # ~2-3 min to extract 16 GB vs 20+ min with shutil.copytree over FUSE.
+    print("📂 Extracting Hunyuan3D from Drive tarball (~2-3 min)...")
+    ret = get_ipython().system(f"tar -xf {hunyuan_tar} -C /content/models")
+    if ret:
+        raise RuntimeError(f"tar extraction failed (exit {ret}). Check tarball integrity.")
+    print(f"✅ Hunyuan3D extracted from tarball.")
+
 elif os.path.exists(hunyuan_gdrive) and os.listdir(hunyuan_gdrive):
-    print("📂 Copying Hunyuan3D from Google Drive cache...")
+    # Legacy fallback: raw HuggingFace cache tree on Drive.
+    # shutil.copytree is slow (~20 min) because HF cache has thousands of small files
+    # and each one is a separate FUSE API call.  After this copy we pack a tarball so
+    # the next session uses the fast path instead.
+    print("📂 Copying Hunyuan3D from Drive raw cache (slow — one-time, ~20 min)...")
+    print("   ⚠️  A tarball will be packed afterward so future sessions take ~2-3 min.")
     shutil.copytree(hunyuan_gdrive, hunyuan_cache, dirs_exist_ok=True)
-    print(f"✅ Hunyuan3D: copied from Drive cache")
+    print("✅ Copy done.  Packing tarball for future fast restores...")
+    ret = get_ipython().system(f"tar -cf {hunyuan_tar} -C /content/models hunyuan3d")
+    if ret:
+        print(f"⚠️  Tarball packing failed (exit {ret}) — next session will still use slow copy.")
+    else:
+        print(f"✅ Tarball saved to Drive: {hunyuan_tar}")
+
 else:
+    # Nothing on Drive — download fresh from HuggingFace, then pack a tarball.
     from huggingface_hub import snapshot_download
 
     if not shape_cached:
@@ -279,9 +311,13 @@ else:
         )
         print("✅ Texture downloaded.")
 
-    os.makedirs(hunyuan_gdrive, exist_ok=True)
-    shutil.copytree(hunyuan_cache, hunyuan_gdrive, dirs_exist_ok=True)
-    print("💾 Saved Hunyuan3D to Google Drive cache.")
+    os.makedirs(GDRIVE_CACHE, exist_ok=True)
+    print("💾 Packing Hunyuan3D to Drive tarball for fast future restores (~5 min)...")
+    ret = get_ipython().system(f"tar -cf {hunyuan_tar} -C /content/models hunyuan3d")
+    if ret:
+        print(f"⚠️  Tarball packing failed (exit {ret}) — weights are in /content but not persisted to Drive.")
+    else:
+        print(f"✅ Tarball saved: {hunyuan_tar}")
 
 print(f"✅ Hunyuan3D cache: {hunyuan_cache}")
 
@@ -361,6 +397,10 @@ print("✅ Stage 1 complete. Bboxes shown above.")
 # =============================================================================
 # CELL 9 — Stage 2: SAM2 segmentation
 # =============================================================================
+# RECOMMENDED WORKFLOW:
+#   Run Cell 9a first → inspect all 3 candidate masks per view in a grid.
+#   Run Cell 9b        → set FRONT_MASK_IDX / BACK_MASK_IDX, then run pipeline.
+#   If auto-selection was correct (both masks look good), skip 9a/9b and use Cell 9 directly.
 
 from src.segmentation import run_segmentation
 import numpy as np
@@ -371,6 +411,74 @@ seg_result = run_segmentation(
     gemini=gemini,
     max_feedback_iters=3,
     overlay_save_path="/content/output/final_overlay.png",
+)
+
+print(f"\n✅ Segmentation complete:")
+print(f"   Iterations: {seg_result.iterations_used}")
+print(f"   {seg_result.validation_notes}")
+print(f"   Front mask — pixels: {seg_result.front_mask.sum():,}")
+print(f"   Back mask  — pixels: {seg_result.back_mask_modal.sum():,}")
+
+display(seg_result.overlay_image)
+display(seg_result.front_rgba)
+display(seg_result.back_rgba_modal)
+
+
+# =============================================================================
+# CELL 9a — Inspect all SAM2 mask candidates (run when auto-selection is wrong)
+# =============================================================================
+# SAM2 returns 3 candidate masks per view; this cell shows all 6 so you can
+# pick the correct index.  Front row = front view, Back row = back view.
+# Scores are shown in the title — but highest score ≠ always correct panel.
+# After picking, set the indices in Cell 9b.
+
+from src.segmentation import inspect_segmentation_masks, render_mask_overlay
+import matplotlib.pyplot as plt
+
+candidates = inspect_segmentation_masks(
+    composite_path=COMPOSITE_IMAGE,
+    parse_result=parse_result,
+    save_dir="/content/output/mask_candidates",
+)
+
+fig, axes = plt.subplots(2, 3, figsize=(16, 10))
+for col in range(3):
+    front_overlay = render_mask_overlay(candidates.composite_rgb, {"front": candidates.front_masks[col]})
+    axes[0, col].imshow(front_overlay)
+    axes[0, col].set_title(f"Front [{col}]  score={candidates.front_scores[col]:.3f}", fontsize=12)
+    axes[0, col].axis("off")
+
+    back_overlay = render_mask_overlay(candidates.composite_rgb, {"back": candidates.back_masks[col]})
+    axes[1, col].imshow(back_overlay)
+    axes[1, col].set_title(f"Back  [{col}]  score={candidates.back_scores[col]:.3f}", fontsize=12)
+    axes[1, col].axis("off")
+
+plt.suptitle("SAM2 Mask Candidates — blue=front, orange=back\nPick the index that covers the product panel, not background", fontsize=13)
+plt.tight_layout()
+plt.show()
+print("\n✅ Individual overlays also saved to /content/output/mask_candidates/")
+
+
+# =============================================================================
+# CELL 9b — Run segmentation with manually chosen mask indices
+# =============================================================================
+# Edit FRONT_MASK_IDX and BACK_MASK_IDX based on Cell 9a output.
+# -1 = auto (SAM2 highest-score) | 0, 1, 2 = explicit candidate index
+
+FRONT_MASK_IDX = -1   # ← change to 0, 1, or 2 after inspecting Cell 9a
+BACK_MASK_IDX  = -1   # ← change to 0, 1, or 2 after inspecting Cell 9a
+
+from src.segmentation import run_segmentation
+import numpy as np
+
+seg_result = run_segmentation(
+    composite_path=COMPOSITE_IMAGE,
+    parse_result=parse_result,
+    gemini=gemini,
+    max_feedback_iters=3,
+    overlay_save_path="/content/output/final_overlay.png",
+    front_mask_idx=FRONT_MASK_IDX,
+    back_mask_idx=BACK_MASK_IDX,
 )
 
 print(f"\n✅ Segmentation complete:")
