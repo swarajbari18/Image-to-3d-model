@@ -44,7 +44,7 @@ class ModelManager:
         "synergyamodal": 10_000,
         "sd_inpaint": 5_000,
         "hunyuan3d_shape": 6_500,
-        "hunyuan3d_texture": 14_000,
+        "hunyuan3d_texture": 6_500,
     }
 
     def __init__(self, device: str = "cuda", verbose: bool = True) -> None:

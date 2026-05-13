@@ -210,10 +210,10 @@ class PipelineConfig:
     def sam2_config_name(self) -> str:
         """Map variant → SAM2 YAML config filename."""
         variant_map = {
-            "tiny": "sam2_hiera_t.yaml",
-            "small": "sam2_hiera_s.yaml",
-            "base_plus": "sam2_hiera_b+.yaml",
-            "large": "sam2_hiera_l.yaml",
+            "tiny": "sam2.1_hiera_t.yaml",
+            "small": "sam2.1_hiera_s.yaml",
+            "base_plus": "sam2.1_hiera_b+.yaml",
+            "large": "sam2.1_hiera_l.yaml",
         }
         return variant_map.get(self.SAM2_VARIANT, "sam2_hiera_l.yaml")
 

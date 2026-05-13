@@ -10,7 +10,7 @@ Architecture:
     Stage 2 (texture): Hunyuan3DPaintPipeline
                        Inputs: same front/back RGBA + stage-1 mesh
                        Output: textured GLB (PBR, baked UV)
-                       VRAM: ~10-14 GB — separate load after stage 1 is unloaded
+                       VRAM: ~6 GB — separate load after stage 1 is unloaded
 
   The two stages must NEVER be in VRAM simultaneously on a 16 GB GPU.
 
@@ -143,18 +143,19 @@ def _build_hunyuan_shape_loader():
 def _build_hunyuan_texture_loader():
     """Return a loader fn for the Hunyuan3D texture pipeline.
 
-    Texture model is in tencent/Hunyuan3D-2 (NOT tencent/Hunyuan3D-2mv).
-    Uses subfolder='hunyuan3d-paint-v2-0-turbo' (~6 GB) not the whole repo.
+    Texture model is in tencent/Hunyuan3D-2.1 (NOT tencent/Hunyuan3D-2mv).
+    Uses subfolder='hunyuan3d-paintpbr-v2-1' (~6 GB) — PBR paint from v2.1.
+    Saves ~8 GB of disk vs the full v2.0 non-turbo paint model.
     """
 
     def _load():
         sys.path.insert(0, str(cfg.HUNYUAN3D_REPO_DIR))
         from hy3dgen.texgen import Hunyuan3DPaintPipeline  # type: ignore[import]
 
-        print("[reconstruction] Loading Hunyuan3D texture pipeline (fp16, turbo)...")
+        print("[reconstruction] Loading Hunyuan3D texture pipeline (fp16, paintpbr-v2-1)...")
         pipeline = Hunyuan3DPaintPipeline.from_pretrained(
-            "tencent/Hunyuan3D-2",
-            subfolder="hunyuan3d-paint-v2-0-turbo",
+            "tencent/Hunyuan3D-2.1",
+            subfolder="hunyuan3d-paintpbr-v2-1",
             torch_dtype=cfg.TORCH_DTYPE,
             cache_dir=str(cfg.HUNYUAN3D_CACHE_DIR),
             token=cfg.HF_TOKEN,
@@ -230,7 +231,7 @@ def run_reconstruction(
 
     VRAM flow (never exceeds 16 GB):
       1. assert ≥ 6.5 GB → load shape pipeline → infer → unload shape pipeline
-      2. assert ≥ 14 GB  → load texture pipeline → infer → unload texture pipeline
+      2. assert ≥ 6.5 GB → load texture pipeline → infer → unload texture pipeline
 
     Args:
         front_rgba:          RGBA PIL Image of front panel (any size).

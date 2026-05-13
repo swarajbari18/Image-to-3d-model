@@ -85,8 +85,10 @@ else:
     print("✅ SynergyAmodal already present — skipping clone.")
 
 # --- Install SynergyAmodal requirements ---
-# requirements.txt uses modern compatible versions — install as-is.
-# Only skip gradio (not needed in pipeline) to save install time.
+# Manually listed (not pip install -r) so we can:
+#   - Skip gradio (not needed in pipeline)
+#   - Drop numpy==1.26.4 pin: Colab's opencv/jax/cupy need numpy>=2; SynergyAmodal's
+#     inference code is compatible with numpy 2.x, so the pin is unnecessary here.
 # xformers is required for memory-efficient attention (per SynergyAmodal README).
 get_ipython().system(
     "pip install -q "
@@ -94,7 +96,6 @@ get_ipython().system(
     "addict==2.4.0 "
     "diffusers==0.31.0 "
     "easydict==1.13 "
-    "numpy==1.26.4 "
     "omegaconf==2.3.0 "
     "onnxruntime==1.22.0 "
     "pycocotools==2.0.8 "
@@ -103,16 +104,26 @@ get_ipython().system(
 )
 get_ipython().system("pip install -q xformers")  # required for memory-efficient attention
 
+# --- Restore numpy>=2 (safety net: some pip solvers may still pull in numpy 1.x) ---
+get_ipython().system('pip install -q "numpy>=2.0"')
+
 # --- Add to sys.path so imports work at runtime ---
 if "/content/SynergyAmodal" not in sys.path:
     sys.path.insert(0, "/content/SynergyAmodal")
 
 # --- Verify core imports ---
 try:
+    import numpy as np
+    numpy_major = int(np.__version__.split(".")[0])
+    if numpy_major < 2:
+        raise RuntimeError(
+            f"numpy {np.__version__} < 2.0 — cv2 will break. "
+            "Check if a package above re-pinned numpy to 1.x."
+        )
     from omegaconf import OmegaConf
     from addict import Dict
-    print("✅ SynergyAmodal deps importable — Cell 4 complete.")
-except ImportError as e:
+    print(f"✅ SynergyAmodal deps importable — numpy={np.__version__} — Cell 4 complete.")
+except (ImportError, RuntimeError) as e:
     print(f"⚠️  Import check failed: {e}")
 
 
@@ -138,8 +149,12 @@ if not os.path.exists("/content/Hunyuan3D-2"):
 
     # Step 4: Compile custom CUDA rasterizer (REQUIRED for texture generation)
     try:
-        get_ipython().system("cd /content/Hunyuan3D-2/hy3dgen/texgen/custom_rasterizer && python3 setup.py install")
-        get_ipython().system("cd /content/Hunyuan3D-2/hy3dgen/texgen/differentiable_renderer && bash compile_mesh_painter.sh")
+        rc1 = get_ipython().system("cd /content/Hunyuan3D-2/hy3dgen/texgen/custom_rasterizer && python3 setup.py install")
+        if rc1:
+            raise RuntimeError(f"custom_rasterizer setup.py exited with code {rc1}")
+        rc2 = get_ipython().system("cd /content/Hunyuan3D-2/hy3dgen/texgen/differentiable_renderer && python3 setup.py install")
+        if rc2:
+            raise RuntimeError(f"differentiable_renderer setup.py exited with code {rc2}")
         print("✅ Hunyuan3D CUDA rasterizer compiled successfully.")
     except Exception as e:
         print(f"⚠️  CUDA rasterizer compilation failed: {e}")
@@ -153,7 +168,7 @@ else:
 # =============================================================================
 # SAM2:           ~224 MB  — Meta CDN, no token
 # SynergyAmodal:  ~16.5 GB — cloudyfall/DeoccAnything on HuggingFace (ldm=15.6 GB, vae=929 MB)
-# Hunyuan3D: ~8-10 GB  — HuggingFace, HF_TOKEN required
+# Hunyuan3D: ~16 GB  — shape (~10 GB) + paintpbr-v2-1 (~6 GB), HF_TOKEN required
 
 import os, shutil
 from pathlib import Path
@@ -211,14 +226,12 @@ if not os.path.exists(ldm_ckpt) or not os.path.exists(vae_ckpt):
 print(f"✅ SynergyAmodal: {ldm_ckpt} ({os.path.getsize(ldm_ckpt)/1e9:.1f} GB), {vae_ckpt} ({os.path.getsize(vae_ckpt)/1e6:.0f} MB)")
 
 # --- Hunyuan3D weights (shape + texture) ---
-# Shape:   tencent/Hunyuan3D-2mv  → subfolder hunyuan3d-dit-v2-mv       (~10 GB, standard)
-# Texture: tencent/Hunyuan3D-2    → subfolder hunyuan3d-paint-v2-0-turbo  (~6 GB)
+# Shape:   tencent/Hunyuan3D-2mv  → subfolder hunyuan3d-dit-v2-mv         (~10 GB, standard)
+# Texture: tencent/Hunyuan3D-2.1  → subfolder hunyuan3d-paintpbr-v2-1      (~6 GB, PBR v2.1)
 #
-# WHY STANDARD (not Turbo)?
-#   Standard uses full 50-step diffusion = better geometric detail on complex
-#   surfaces like the camera island/bump. Turbo (4-8 steps) is faster but trades
-#   some detail. For product photography fidelity, standard is the right call.
-#   To switch to Turbo: change allow_patterns below + subfolder in reconstruction.py.
+# WHY hunyuan3d-paintpbr-v2-1 (not v2.0-turbo)?
+#   Same ~6 GB footprint but upgraded to the v2.1 PBR paint model which produces
+#   better material quality. Saves disk vs the full v2.0 non-turbo paint (~14 GB).
 #
 # WHY allow_patterns?
 #   snapshot_download with no filter grabs ALL variants in the repo = ~29 GB.
@@ -235,7 +248,7 @@ os.makedirs(hunyuan_cache, exist_ok=True)
 # Check if already cached (HF creates model--tencent dirs inside cache_dir)
 import glob
 shape_cached = bool(glob.glob(f"{hunyuan_cache}/models--tencent--Hunyuan3D-2mv/**", recursive=True))
-tex_cached   = bool(glob.glob(f"{hunyuan_cache}/models--tencent--Hunyuan3D-2/**", recursive=True))
+tex_cached   = bool(glob.glob(f"{hunyuan_cache}/models--tencent--Hunyuan3D-2.1/**", recursive=True))
 
 if shape_cached and tex_cached:
     print(f"✅ Hunyuan3D weights already in cache: {hunyuan_cache}")
@@ -257,10 +270,10 @@ else:
         print("✅ Shape downloaded.")
 
     if not tex_cached:
-        print("⬇️  Downloading Hunyuan3D texture (hunyuan3d-paint-v2-0-turbo, ~6 GB)...")
+        print("⬇️  Downloading Hunyuan3D texture (hunyuan3d-paintpbr-v2-1, ~6 GB)...")
         snapshot_download(
-            repo_id="tencent/Hunyuan3D-2",
-            allow_patterns=["hunyuan3d-paint-v2-0-turbo/**"],
+            repo_id="tencent/Hunyuan3D-2.1",
+            allow_patterns=["hunyuan3d-paintpbr-v2-1/**"],
             cache_dir=hunyuan_cache,
             token=os.environ["HF_TOKEN"],
         )
@@ -279,7 +292,7 @@ print(f"✅ Hunyuan3D cache: {hunyuan_cache}")
 
 import sys, os
 
-REPO_URL = "https://github.com/YOUR_USERNAME/Image-to-3d-model.git"  # ← update this
+REPO_URL = "https://github.com/swarajbari18/Image-to-3d-model.git"  # ← update this
 REPO_DIR = "/content/Image-to-3d-model"
 
 if not os.path.exists(REPO_DIR):
@@ -313,7 +326,7 @@ from src.config import cfg
 from src.gemini_client import GeminiClient
 
 # --- Upload / path ---
-COMPOSITE_IMAGE = "/content/41dk3-EPzyL.png"   # ← change if your filename differs
+COMPOSITE_IMAGE = "/content/Image-to-3d-model/41dk3-EPzyL.png"   # ← change if your filename differs
 
 gemini = GeminiClient()
 parse_result = gemini.parse_composite(COMPOSITE_IMAGE)
@@ -430,7 +443,7 @@ display(amodal_result.best_candidate)
 # CELL 12 — Stage 5: Hunyuan3D-2mv 3D reconstruction
 # =============================================================================
 # ⚠️  SynergyAmodal must be unloaded. ModelManager handles this automatically.
-# ⚠️  Shape stage: ~6 GB. Texture stage: ~10-14 GB. Never both at once.
+# ⚠️  Shape stage: ~6 GB. Texture stage: ~6 GB. Never both at once.
 
 from src.reconstruction import run_reconstruction
 
